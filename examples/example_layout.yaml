@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# Plate layout for Example_data.csv
+#
+# Blocks are painted onto the plate in order, so a later block overrides an
+# earlier one for any well they share.  Concentrations carry their own units -
+# nM here, uM there - and nothing needs converting by hand.
+# ---------------------------------------------------------------------------
+name: Example inhibitor titration
+plate: 96
+
+# What to call each factor in tables and figures (rename freely).
+labels:
+  protein: Enzyme
+  compound: Inhibitor
+  substrate: Substrate
+
+# Units used when results are displayed. Delete a line to let the tool choose.
+units:
+  protein: nM
+  compound: uM
+  substrate: uM
+
+# Applied to every block unless the block says otherwise.
+defaults:
+  protein:
+    name: Protein-X          # <- your enzyme
+    conc: 5 nM
+
+blocks:
+  - name: Inhibitor dose-response
+    wells: A1:F12
+    # Inhibitor: 3-fold serial dilution left to right, in duplicate columns.
+    # Columns 1+2 highest (10 uM) ... columns 11+12 lowest.
+    compound:
+      name: Compound-1       # <- your test compound
+      series:
+        across: columns
+        replicates: 2        # duplicate columns share a concentration
+        top: 10 uM
+        dilution: 3
+    # Substrate: 2-fold serial dilution down the rows, A highest ... F lowest.
+    substrate:
+      name: FRET-substrate   # <- your substrate
+      series:
+        across: rows
+        top: 50 uM
+        dilution: 2
+
+  - name: No-inhibitor controls
+    wells: G1:G12
+    role: positive_control   # 100% activity reference
+    compound:
+      name: DMSO
+      conc: 0
+    substrate:
+      name: FRET-substrate
+      series:
+        across: columns
+        replicates: 2
+        top: 50 uM
+        dilution: 2
+
+  - name: No-substrate / no-inhibitor background
+    wells: H1:H2
+    role: blank
+    compound:
+      name: DMSO
+      conc: 0
+    substrate:
+      name: FRET-substrate
+      conc: 0
+
+  - name: Unused wells
+    wells: H3:H12
+    role: empty
