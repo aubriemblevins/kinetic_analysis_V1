@@ -513,3 +513,193 @@ def plot_rate_heatmap(result: AnalysisResult, path=None,
         bar.outline.set_visible(False)
         fig.tight_layout()
     return _save(fig, path)
+
+
+# --- why this window ------------------------------------------------------
+
+def _rolling_rate(time: np.ndarray, signal: np.ndarray, width: int):
+    """Local slope through a sliding window - the curve's rate over time."""
+    finite = np.isfinite(time) & np.isfinite(signal)
+    x, y = time[finite], signal[finite]
+    if x.size < width + 1:
+        return np.array([]), np.array([])
+    half = width // 2
+    centres, slopes = [], []
+    for start in range(0, x.size - width + 1):
+        xs, ys = x[start:start + width], y[start:start + width]
+        var = np.sum((xs - xs.mean()) ** 2)
+        if var <= 0:
+            continue
+        centres.append(xs[half] if width % 2 else xs.mean())
+        slopes.append(np.sum((xs - xs.mean()) * (ys - ys.mean())) / var)
+    return np.array(centres), np.array(slopes)
+
+
+def plot_window_choice(
+    result: AnalysisResult,
+    path=None,
+    theme: str | Theme = "light",
+    time_unit: str = "min",
+    tolerance: float = 10.0,
+):
+    """Show why the fitting window is where it is.
+
+    Top: the window every matched group ended up with, against the readings its
+    reference wells were individually straight over.  Below, per group: the
+    reference curves with the applied window shaded, and the same curves'
+    *local* rate over time - the direct argument, since a flat local rate is
+    what "still linear" means.  Where it rolls off is where the window ends.
+    """
+    palette = _theme(theme)
+    plan = result.window_plan
+    if plan is None or plan.scope_used == "well":
+        raise ValueError(
+            "no shared window to justify - each well was fitted over its own "
+            "range (window scope 'well')")
+
+    factor = time_factor(time_unit)
+    groups = plan.groups
+    detailed = [g for g in groups if g.reference_fits
+                and "no usable reference" not in g.notes]
+    if not detailed:
+        raise ValueError("no reference wells had enough signal to show a window")
+
+    n = len(detailed)
+    width = max(9.0, min(2.9 * n + 1.5, 26.0))
+    with plt.rc_context(palette.rc):
+        fig = plt.figure(figsize=(width, 9.2))
+        spec = fig.add_gridspec(3, n, height_ratios=[1.25, 1.0, 1.0],
+                                hspace=0.42, wspace=0.28)
+
+        strip = fig.add_subplot(spec[0, :])
+        _window_strip(strip, result, groups, palette, factor, time_unit)
+
+        for column, group in enumerate(detailed):
+            curve_ax = fig.add_subplot(spec[1, column])
+            rate_ax = fig.add_subplot(spec[2, column], sharex=curve_ax)
+            _reference_panel(curve_ax, rate_ax, result, group, palette, factor,
+                             time_unit, tolerance)
+            if column == 0:
+                curve_ax.set_ylabel(f"{result.signal_label}\n(reference wells)")
+                rate_ax.set_ylabel("local rate\n(% of fitted rate)")
+            rate_ax.set_xlabel(f"Time ({time_unit})")
+
+        handles = [
+            Line2D([], [], color=palette.series[0], lw=2.0, label="reference well"),
+            Patch(facecolor=palette.grid, alpha=0.9, label="readings left out"),
+            Line2D([], [], color=palette.fit, lw=1.4, ls=(0, (4, 2)),
+                   label="edge of the window used for every well"),
+            Line2D([], [], color=palette.muted, lw=1.2, ls="--",
+                   label=f"±{tolerance:g}% of the fitted rate"),
+        ]
+        fig.legend(handles=handles, loc="upper right", ncol=4, fontsize=9,
+                   bbox_to_anchor=(0.995, 0.995), labelcolor=palette.secondary)
+        fig.suptitle("Why this window", color=palette.ink, fontsize=13,
+                     x=0.006, y=0.995, ha="left", va="top")
+        fig.text(0.006, 0.966, plan.summary(), color=palette.secondary,
+                 fontsize=9, ha="left", va="top")
+        fig.subplots_adjust(left=0.10, right=0.985, top=0.90, bottom=0.07)
+    return _save(fig, path)
+
+
+def _shade_excluded(ax, x, start_t, end_t, palette: Theme) -> None:
+    """Grey the readings outside the window, and mark its edges."""
+    left, right = float(np.min(x)), float(np.max(x))
+    if start_t > left:
+        ax.axvspan(left, start_t, color=palette.grid, alpha=0.9, zorder=0)
+    if end_t < right:
+        ax.axvspan(end_t, right, color=palette.grid, alpha=0.9, zorder=0)
+    for edge, shown in ((start_t, start_t > left), (end_t, end_t < right)):
+        if shown:
+            ax.axvline(edge, color=palette.fit, lw=1.4, ls=(0, (4, 2)),
+                       zorder=5)
+
+
+def _window_strip(ax, result, groups, palette: Theme, factor, time_unit):
+    """One bar per matched group: the readings it is fitted over."""
+    plan = result.window_plan
+    time = plan.time
+    labels = []
+    for row, group in enumerate(reversed(groups)):
+        applied = plan.well_window.get(group.wells[0])
+        start, end = applied if applied else (group.start_index, group.end_index)
+        ax.barh(row, (time[end] - time[start]) / factor,
+                left=time[start] / factor, height=0.5,
+                color=palette.fit, alpha=0.85, zorder=3)
+        # What each reference well was individually straight over.
+        for offset, (well, fit) in enumerate(sorted(group.reference_fits.items())):
+            ax.plot([fit.start_time / factor, fit.end_time / factor],
+                    [row + 0.34 + offset * 0.1] * 2, color=palette.muted,
+                    lw=1.4, solid_capstyle="butt", zorder=4)
+        if "no usable reference" in group.notes:
+            ax.text(time[end] / factor + 1, row, "no signal to judge by",
+                    va="center", fontsize=7.5, color=palette.muted)
+        labels.append(group.label.replace(" | ", "\n"))
+
+    ax.set_yticks(range(len(groups)), labels, fontsize=7.5)
+    ax.set_xlim(float(time.min()) / factor, float(time.max()) / factor * 1.02)
+    ax.set_ylim(-0.6, len(groups) - 0.25)
+    ax.set_xlabel(f"Time ({time_unit})")
+    ax.set_title("The window each matched group is fitted over "
+                 "(grey ticks: where each reference well was straight on its own)",
+                 color=palette.ink, loc="left", fontsize=10, pad=8)
+    ax.grid(True, axis="x", lw=0.6, alpha=0.9)
+    ax.set_axisbelow(True)
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+
+
+def _reference_panel(curve_ax, rate_ax, result, group, palette: Theme, factor,
+                     time_unit, tolerance):
+    data = result.data
+    plan = result.window_plan
+    applied = plan.well_window.get(group.wells[0],
+                                   (group.start_index, group.end_index))
+    start_t = float(plan.time[applied[0]]) / factor
+    end_t = float(plan.time[applied[1]]) / factor
+    x = data.time / factor
+    colour = palette.series[0]
+
+    width = max(5, min(int(round(0.12 * data.n_timepoints)), 25))
+    for index, well in enumerate(group.reference_wells):
+        if well not in data.wells:
+            continue
+        y = data.series(well)
+        curve_ax.plot(x, y, color=colour, lw=1.4, alpha=0.9 - 0.2 * index,
+                      zorder=3)
+        outcome = result.wells.get(well)
+        if outcome is not None and outcome.fit is not None:
+            ends = np.array([outcome.fit.start_time, outcome.fit.end_time])
+            curve_ax.plot(ends / factor, outcome.fit.predict(ends),
+                          color=palette.ink, lw=0.9, ls="--", zorder=4,
+                          alpha=0.7)
+            reference_rate = outcome.fit.slope
+        else:
+            reference_rate = None
+
+        centres, slopes = _rolling_rate(data.time, y, width)
+        if centres.size and reference_rate:
+            rate_ax.plot(centres / factor, 100 * slopes / reference_rate,
+                         color=colour, lw=1.4, alpha=0.9 - 0.2 * index, zorder=3)
+
+    for ax in (curve_ax, rate_ax):
+        # Grey out what was dropped rather than tinting what was kept: when the
+        # window is most of the run, tinting it colours the whole panel and the
+        # thing worth seeing - what got left out - disappears.
+        _shade_excluded(ax, x, start_t, end_t, palette)
+        ax.grid(True, lw=0.6, alpha=0.9)
+        ax.set_axisbelow(True)
+        ax.tick_params(labelsize=8)
+        ax.set_xlim(float(x.min()), float(x.max()))
+    curve_ax.tick_params(labelbottom=False)
+
+    rate_ax.axhline(100, color=palette.muted, lw=1.0, zorder=2)
+    for edge in (100 - tolerance, 100 + tolerance):
+        rate_ax.axhline(edge, color=palette.muted, lw=1.1, ls="--", zorder=2)
+    low, high = rate_ax.get_ylim()
+    rate_ax.set_ylim(max(0.0, min(low, 100 - 2.2 * tolerance)),
+                     min(220.0, max(high, 100 + 2.2 * tolerance)))
+
+    title = group.label.split(" | ")[-1]
+    curve_ax.set_title(f"{title}\n{', '.join(group.reference_wells)}",
+                       color=palette.secondary, fontsize=9, loc="left")

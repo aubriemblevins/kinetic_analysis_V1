@@ -198,6 +198,9 @@ def write_outputs(
     write_csv(wells, "well_results.csv")
     write_csv(conditions, "condition_means.csv")
     write_csv(result.plate_map.to_frame(result.units), "plate_map_resolved.csv")
+    if result.window_plan is not None and result.window_plan.groups:
+        write_csv(pd.DataFrame(result.window_plan.to_rows()),
+                  "linear_range_windows.csv")
 
     prism_dir = out_dir / "prism"
     prism_dir.mkdir(exist_ok=True)
@@ -230,6 +233,11 @@ def write_outputs(
         written.append(plotting.plot_plate_curves(
             result, figure_dir / "plate_curves.png", scale=plate_scale,
             theme=theme))
+        try:
+            written.append(plotting.plot_window_choice(
+                result, figure_dir / "window_choice.png", theme=theme))
+        except ValueError:
+            pass  # per-well windows, or no reference well with enough signal
         try:
             written.append(plotting.plot_rate_heatmap(
                 result, figure_dir / "rate_heatmap.png", theme=theme))
@@ -280,6 +288,15 @@ def _write_report(result: AnalysisResult, path: Path) -> Path:
         "all": "the whole curve, no window selection",
     }[settings["method"]]
     lines.append(f"Method         : {settings['method']} - {described}")
+    plan = result.window_plan
+    if plan is not None:
+        lines.append(f"Window sharing : {plan.summary()}")
+        if plan.match_on:
+            lines.append("Matched on     : "
+                         + ", ".join(result.plate_map.label_for(f)
+                                     for f in plan.match_on))
+        for note in plan.notes:
+            lines.append(f"                 {note}")
     lines.append(f"Scatter allowed: {settings['residual_tolerance']:g} x the "
                  f"well's noise (at {settings['confidence']:.0%} confidence)")
     lines.append("Minimum window : "
@@ -292,6 +309,17 @@ def _write_report(result: AnalysisResult, path: Path) -> Path:
                      f"{_fmt(settings['search_start'])}-"
                      f"{_fmt(settings['search_end'])} s")
     lines.append(f"Background     : {result.blank_summary or result.blank_mode}")
+
+    if plan is not None and plan.groups:
+        lines += ["", "The window each matched group is fitted over", "-" * 43,
+                  "  (reference wells decide it; see figures/window_choice.png)"]
+        for row in plan.to_rows():
+            lines.append(f"  {row['applied window (min)']:>16s} min  "
+                         f"{row['readings used']:>4d} readings  "
+                         f"[refs {row['reference wells'] or 'none'}]  "
+                         f"{row['group']}")
+            if row["notes"]:
+                lines.append(f"      note: {row['notes']}")
 
     flagged = result.flagged_wells()
     lines += ["", "Wells to look at", "-" * 16]

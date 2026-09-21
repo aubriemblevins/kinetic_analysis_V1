@@ -13,6 +13,42 @@ from .platemap import PlateMap, PlateMapError, read_map
 from .plates import PlateFormat
 from .readers import ReaderError, read_kinetics
 from .templates import blank_long_map, starter_layout
+from .windows import REFERENCES, SCOPES, WindowPolicy
+
+
+def _add_window_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group(
+        "sharing the window",
+        "A slope is only comparable with another if both came from the same "
+        "stretch of the reaction, so one window is chosen - from the "
+        "no-inhibitor controls - and shared by matched wells.")
+    group.add_argument(
+        "--window", choices=SCOPES, default="auto", dest="window_scope",
+        help="how widely to share the fitting window: plate (one window for "
+             "every well), group (one per protein/substrate combination), "
+             "well (each well its own - not comparable), auto (plate-wide "
+             "where that works, else group; the default)")
+    group.add_argument(
+        "--window-reference", choices=REFERENCES, default="controls",
+        help="which wells decide the window (default: the no-inhibitor "
+             "controls, falling back to the fastest wells)")
+    group.add_argument(
+        "--window-consensus", choices=["intersection", "median"],
+        default="intersection",
+        help="combine the reference wells by the range they all share "
+             "(default) or by their median")
+    group.add_argument(
+        "--window-match", default=None, metavar="FACTORS",
+        help="comma-separated factors wells must share to share a window "
+             "(default: every factor except the test compound)")
+
+
+def _policy_from(args) -> WindowPolicy:
+    match_on = None
+    if args.window_match:
+        match_on = [f.strip() for f in args.window_match.split(",") if f.strip()]
+    return WindowPolicy(scope=args.window_scope, reference=args.window_reference,
+                        consensus=args.window_consensus, match_on=match_on)
 
 
 def _add_detection_arguments(parser: argparse.ArgumentParser) -> None:
@@ -116,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-excel", action="store_true", help="skip the workbook")
     run.add_argument("--quiet", action="store_true")
     _add_detection_arguments(run)
+    _add_window_arguments(run)
 
     check = subparsers.add_parser(
         "check", help="report what is in a kinetic file, without analysing it")
@@ -200,7 +237,7 @@ def main(argv=None) -> int:
         result = analyse(
             data, plate_map, _settings_from(args), blank_mode=args.blank,
             rate_unit=args.rate_unit, signal_label=args.signal,
-            units=_parse_units(args.unit))
+            units=_parse_units(args.unit), window_policy=_policy_from(args))
     except ValueError as exc:
         print(f"Analysis failed: {exc}", file=sys.stderr)
         return 2
@@ -211,6 +248,8 @@ def main(argv=None) -> int:
 
     if not args.quiet:
         print(result.plate_map.summary())
+        if result.window_plan is not None:
+            print(result.window_plan.summary())
         print(result.summary())
         flagged = result.flagged_wells()
         if flagged:
@@ -221,6 +260,7 @@ def main(argv=None) -> int:
         print("  condition_means.csv   replicate means, SD, SEM, CV")
         print("  prism/                paste-ready XY tables")
         print("  figures/plate_curves.png   every curve with its fitted range")
+        print("  figures/window_choice.png  why the window is where it is")
         print("  analysis_report.txt   what was done, and what to look at")
     return 0
 

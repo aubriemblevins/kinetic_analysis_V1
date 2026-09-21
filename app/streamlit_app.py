@@ -28,6 +28,7 @@ from enzkin.plates import PLATE_FORMATS, PlateFormat, expand_wells  # noqa: E402
 from enzkin.readers import ReaderError, read_kinetics          # noqa: E402
 from enzkin.templates import starter_layout                    # noqa: E402
 from enzkin.units import known_units                           # noqa: E402
+from enzkin.windows import WindowPolicy                        # noqa: E402
 
 EXAMPLE_DATA = Path(__file__).resolve().parent.parent / "examples" / "Example_data.csv"
 EXAMPLE_LAYOUT = (Path(__file__).resolve().parent.parent / "examples"
@@ -167,6 +168,34 @@ def sidebar():
         settings_kwargs["window_points"] = st.sidebar.number_input(
             "Readings per window", 3, 500, 10)
 
+    scope = st.sidebar.selectbox(
+        "Share the window", ["auto", "plate", "group", "well"],
+        format_func=lambda s: {
+            "auto": "Automatic (recommended)",
+            "plate": "One window for the whole plate",
+            "group": "One per protein + substrate",
+            "well": "Each well its own (not comparable)",
+        }[s],
+        help="A slope is only comparable with another if both came from the "
+             "same stretch of the reaction. Automatic uses one window for the "
+             "whole plate when that still leaves a usable range, and one per "
+             "matched group when it does not.")
+    reference = st.sidebar.selectbox(
+        "Decided by", ["controls", "fastest", "all"],
+        format_func=lambda r: {
+            "controls": "The no-inhibitor controls",
+            "fastest": "The fastest wells in each group",
+            "all": "Every well in each group",
+        }[r],
+        help="The controls are the fastest wells, so they bend first - a "
+             "window where they are straight is one where the inhibited wells "
+             "are too.")
+    if scope == "well":
+        st.sidebar.warning(
+            "Per-well windows are not comparable between wells. Use this to "
+            "inspect a curve, not to produce rates.", icon="⚠️")
+    policy = WindowPolicy(scope=scope, reference=reference)
+
     with st.sidebar.expander("More detection options"):
         limit = st.checkbox("Ignore part of the run")
         if limit:
@@ -194,7 +223,7 @@ def sidebar():
     return dict(upload=upload, use_example=use_example, plate_choice=plate_choice,
                 time_unit=time_unit, settings=DetectionSettings(**settings_kwargs),
                 blank_mode=blank_mode, rate_unit=rate_unit, signal=signal,
-                theme=theme)
+                theme=theme, policy=policy)
 
 
 @st.cache_data(show_spinner=False)
@@ -484,6 +513,43 @@ def _zip_everything(result, config) -> bytes:
         return buffer.getvalue()
 
 
+def window_tab(result, config):
+    """The shared window, and the evidence for it."""
+    plan = result.window_plan
+    st.subheader("One window, shared by matched wells")
+    if plan is None or plan.scope_used == "well":
+        st.warning(
+            "Each well is being fitted over its own range, so slopes are not "
+            "comparable between wells: a longer window on a curve that bends "
+            "reads slower for reasons that have nothing to do with the well. "
+            "Change **Share the window** in the sidebar to fix this.", icon="⚠️")
+        return
+
+    st.success(plan.summary(), icon="✅" if plan.is_uniform else "ℹ️")
+    for note in plan.notes:
+        st.caption(note)
+    if plan.match_on:
+        st.caption("Wells share a window when they match on "
+                   + ", ".join(result.plate_map.label_for(f)
+                               for f in plan.match_on)
+                   + " — how long a reaction stays linear depends on how fast "
+                     "it uses its substrate.")
+
+    try:
+        st.pyplot(plotting.plot_window_choice(result, theme=config["theme"]))
+    except ValueError as exc:
+        st.info(str(exc))
+
+    st.markdown("**The window each matched group is fitted over**")
+    st.dataframe(pd.DataFrame(plan.to_rows()), use_container_width=True,
+                 hide_index=True)
+    st.caption(
+        "The bottom row of the figure is the argument: it is each reference "
+        "well's rate measured over a short sliding window, as a percentage of "
+        "the rate finally fitted. While it stays flat the reaction is still "
+        "linear; where it rolls off is where the window has to end.")
+
+
 def curves_tab(result, config):
     st.subheader("Every curve, with the range that was fitted")
     columns = st.columns([1, 1, 2])
@@ -523,6 +589,9 @@ def curves_tab(result, config):
             st.caption(f"`{flag}` — {FLAG_DESCRIPTIONS.get(flag, '')}")
 
         st.markdown("**Override this well's window**")
+        st.caption("Only for a curve the shared window genuinely does not "
+                   "suit — an overridden well is no longer measured over the "
+                   "same stretch as the rest of the plate.")
         override = st.session_state["overrides"].get(choice)
         limits = st.slider(
             "Minutes", 0.0, float(result.data.time[-1] / 60),
@@ -540,8 +609,9 @@ def curves_tab(result, config):
             st.session_state["overrides"].pop(choice, None)
             st.rerun()
     if st.session_state["overrides"]:
-        st.caption("Hand-picked windows: "
-                   + ", ".join(sorted(st.session_state["overrides"])))
+        st.warning("Hand-picked windows, not comparable with the rest of the "
+                   "plate: " + ", ".join(sorted(st.session_state["overrides"])),
+                   icon="⚠️")
 
 
 # --- main -----------------------------------------------------------------
@@ -575,8 +645,9 @@ def main():
     for note in data.notes:
         st.caption(f"ℹ️ {note}")
 
-    tab_map, tab_curves, tab_results, tab_data = st.tabs(
-        ["1 · Plate map", "2 · Curves & fits", "3 · Results", "Raw data"])
+    tab_map, tab_window, tab_curves, tab_results, tab_data = st.tabs(
+        ["1 · Plate map", "2 · Linear range", "3 · Curves & fits",
+         "4 · Results", "Raw data"])
 
     with tab_map:
         plate_map = map_tab(data, config)
@@ -602,12 +673,15 @@ def main():
         result = analyse(
             data, plate_map, config["settings"], blank_mode=config["blank_mode"],
             rate_unit=config["rate_unit"], signal_label=config["signal"],
-            well_settings=st.session_state["overrides"])
+            well_settings=st.session_state["overrides"],
+            window_policy=config["policy"])
     except ValueError as exc:
         with tab_results:
             st.error(str(exc))
         st.stop()
 
+    with tab_window:
+        window_tab(result, config)
     with tab_curves:
         curves_tab(result, config)
     with tab_results:

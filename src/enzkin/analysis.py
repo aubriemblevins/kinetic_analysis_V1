@@ -19,6 +19,7 @@ from .platemap import Factor, PlateMap, WellInfo
 from .plates import sort_wells
 from .readers import KineticData
 from .units import time_factor
+from .windows import WindowPlan, WindowPolicy, fixed_settings, plan_windows
 
 #: How background wells are used.
 BLANK_MODES = {
@@ -100,6 +101,7 @@ class AnalysisResult:
     units: dict[str, str] = field(default_factory=dict)
     z_prime: float | None = None
     warnings: list[str] = field(default_factory=list)
+    window_plan: WindowPlan | None = None
 
     @property
     def rate_label(self) -> str:
@@ -209,12 +211,18 @@ def analyse(
     outlier_sd: float = 2.5,
     cv_warn: float = 20.0,
     well_settings: dict[str, DetectionSettings] | None = None,
+    window_policy: WindowPolicy | None = None,
 ) -> AnalysisResult:
     """Fit every well, correct for background, and average replicates.
 
-    ``well_settings`` overrides the detection settings for named wells, which
-    is how a hand-picked window for one awkward curve is applied without
-    disturbing the rest of the plate.
+    By default the fitting window is chosen once - from the no-inhibitor
+    controls - and shared by every well that matches them on protein and
+    substrate, so that slopes are comparable.  ``window_policy`` controls that;
+    see :mod:`enzkin.windows`.
+
+    ``well_settings`` overrides everything for named wells, which is how a
+    hand-picked window for one awkward curve is applied without disturbing the
+    rest of the plate.
     """
     settings = settings or DetectionSettings()
     if blank_mode not in BLANK_MODES:
@@ -250,18 +258,32 @@ def analyse(
     elif blank_mode != "none" and not blank_wells:
         blank_summary = "No blank wells on this plate; no background subtracted."
 
-    # -- fit every well ----------------------------------------------------
+    # -- choose the window, then fit every well over it ---------------------
     factor_names = plate_map.active_factors()
     per_second_to_unit = time_factor(rate_unit)
+    plan = plan_windows(data, plate_map, settings, window_policy)
+    warnings.extend(plan.notes)
+
+    def signal_for(well: str) -> np.ndarray:
+        series = data.series(well)
+        if blank_trace is not None and plate_map.wells[well].role != "blank":
+            return series - blank_trace
+        return series
+
+    def settings_for(well: str) -> DetectionSettings:
+        override = (well_settings or {}).get(well)
+        if override is not None:
+            return override
+        window = plan.window_for(well)
+        return settings if window is None else fixed_settings(
+            settings, data.time, window)
+
     results: dict[str, WellResult] = {}
     for well in wells:
         info = plate_map.wells[well]
-        signal = data.series(well)
-        if blank_trace is not None and info.role != "blank":
-            signal = signal - blank_trace
         try:
-            fit = detect_linear_range(
-                data.time, signal, (well_settings or {}).get(well, settings))
+            fit = detect_linear_range(data.time, signal_for(well),
+                                      settings_for(well))
         except LinearityError as exc:
             results[well] = WellResult(well, info, None, float("nan"),
                                        float("nan"), float("nan"),
@@ -274,26 +296,35 @@ def analyse(
 
     # -- background correction --------------------------------------------
     if blank_mode == "slope" and blank_wells:
-        blank_rates = [results[w].raw_rate for w in blank_wells
-                       if w in results and results[w].usable]
-        if blank_rates:
+        usable_blanks = [w for w in blank_wells
+                         if w in results and results[w].usable]
+        if usable_blanks:
             match_on = _blank_match_factors(plate_map, blank_wells, factor_names)
-            blanks_by_key = _blank_lookup(results, blank_wells, match_on)
+            by_key: dict[tuple, list[str]] = {}
+            for well in usable_blanks:
+                by_key.setdefault(
+                    _factor_key(results[well].info, match_on), []).append(well)
+
             for well, result in results.items():
                 if result.info.role == "blank" or not result.usable:
                     continue
-                key = _factor_key(result.info, match_on)
-                blank = blanks_by_key.get(key)
+                matched = by_key.get(_factor_key(result.info, match_on),
+                                     usable_blanks)
+                # Measure the background over the same readings as the well it
+                # corrects: a rate subtracted from one stretch of the run has
+                # to have been measured over that same stretch.
+                blank = _blank_rate(data, matched, result.fit, settings,
+                                    per_second_to_unit)
                 if blank is None:
-                    blank = float(np.mean(blank_rates))
+                    continue
                 result.blank_rate = blank
                 result.rate = result.raw_rate - blank
             described = (f"matched on {', '.join(plate_map.label_for(f) for f in match_on)}"
                          if match_on else "plate mean")
             blank_summary = (
-                f"Background subtracted as a rate ({described}) from "
-                f"{len(blank_wells)} blank well(s): "
-                f"{', '.join(blank_wells)}.")
+                f"Background subtracted as a rate ({described}, measured over "
+                f"each well's own fitted window) from {len(usable_blanks)} "
+                f"blank well(s): {', '.join(usable_blanks)}.")
 
     # -- controls: % activity and % inhibition ----------------------------
     control_keys = _control_match_factors(factor_names)
@@ -357,7 +388,7 @@ def analyse(
         data=data, plate_map=plate_map, settings=settings, wells=results,
         conditions=conditions, rate_unit=rate_unit, signal_label=signal_label,
         blank_mode=blank_mode, blank_summary=blank_summary, units=units,
-        z_prime=_z_prime(results), warnings=warnings,
+        z_prime=_z_prime(results), warnings=warnings, window_plan=plan,
     )
     return result
 
@@ -390,15 +421,21 @@ def _blank_match_factors(plate_map: PlateMap, blank_wells, factor_names) -> list
     return varying
 
 
-def _blank_lookup(results, blank_wells, match_on) -> dict[tuple, float]:
-    grouped: dict[tuple, list[float]] = {}
+def _blank_rate(data, blank_wells, fit, settings, per_second_to_unit):
+    """Mean blank rate over exactly the readings ``fit`` used."""
+    if fit is None:
+        return None
+    window = (fit.start_index, fit.end_index)
+    rates = []
     for well in blank_wells:
-        result = results.get(well)
-        if result is None or not result.usable:
+        try:
+            blank_fit = detect_linear_range(
+                data.time, data.series(well),
+                fixed_settings(settings, data.time, window))
+        except LinearityError:
             continue
-        grouped.setdefault(_factor_key(result.info, match_on), []).append(
-            result.raw_rate)
-    return {key: float(np.mean(values)) for key, values in grouped.items()}
+        rates.append(blank_fit.slope * per_second_to_unit)
+    return float(np.mean(rates)) if rates else None
 
 
 def _control_match_factors(factor_names) -> list[str]:

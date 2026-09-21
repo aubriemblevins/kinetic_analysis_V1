@@ -16,9 +16,12 @@ Your browser opens. **Use the example plate** and **Use the example layout**
 are already selected, so you will see:
 
 - **1 · Plate map** — the plate coloured by role. Hover any well.
-- **2 · Curves & fits** — all 96 raw curves, each with the range that was
+- **2 · Linear range** — the one window every well is fitted over, and the
+  evidence for it: the controls' rate over time, flat while the reaction is
+  still linear.
+- **3 · Curves & fits** — all 96 raw curves, each with the range that was
   fitted picked out in blue. Amber wells want a look.
-- **3 · Results** — replicate means, the dose-response plot, and a
+- **4 · Results** — replicate means, the dose-response plot, and a
   **Everything (zip)** button.
 
 ## 3 · Now your own plate
@@ -61,12 +64,17 @@ From `results/prism/`:
 
 Open, select all, paste at the first cell.
 
-## Two things worth checking every time
+## Three things worth checking every time
 
-1. **The plate figure.** If the blue range on a curve is not where you would
+1. **The Linear range tab** (`figures/window_choice.png`). Every well is fitted
+   over the same readings, chosen from the no-inhibitor controls — they are the
+   fastest wells, so a window where *they* are straight is one where the
+   inhibited wells are too. The bottom row shows the controls' rate over time:
+   while it stays flat, the reaction is still linear.
+2. **The plate figure.** If the blue range on a curve is not where you would
    have put it, that well is telling you something — usually a lag, a plateau,
    or a bubble.
-2. **`analysis_report.txt`.** It lists the wells that were flagged and why, and
+3. **`analysis_report.txt`.** It lists the wells that were flagged and why, and
    any conditions whose replicates disagree by more than 20 %.
 
 ## If something does not work
@@ -77,4 +85,5 @@ Open, select all, paste at the first cell.
 | Rates look too low | The curve may be bending — check the plate figure; `--method fixed --fixed-start 0 --fixed-end 10` |
 | Everything is flagged `low_signal` | Genuinely flat wells, or the wrong `--direction` for a falling signal |
 | "no wells to analyse" | The plate map and the data file name different wells |
-| A window is wrong on one well | In the app, open that well and use **Override this well's window** |
+| A window is wrong on one well | In the app, open that well and use **Override this well's window** — but note that an overridden well is no longer measured over the same stretch as the rest of the plate |
+| The window looks too short | One control bends early and is pulling the whole plate in. Open the Linear range tab to see which; `--window group` lets each substrate level keep its own |
