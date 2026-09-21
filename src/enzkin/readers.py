@@ -8,6 +8,7 @@ that and hands back a tidy :class:`KineticData`.
 
 from __future__ import annotations
 
+import csv
 import io
 import re
 from dataclasses import dataclass, field
@@ -155,18 +156,48 @@ def _to_number(value: object) -> float:
 # --- file loading ---------------------------------------------------------
 
 def _read_raw(path_or_buffer, sheet: str | int | None = None) -> pd.DataFrame:
-    """Load a file with no header interpretation at all."""
+    """Load a file with no header interpretation at all.
+
+    Text files go through :mod:`csv` rather than pandas because instrument
+    exports routinely put a few short metadata lines above a wide block of
+    readings, and a strict parser rejects the file for having ragged rows.
+    """
     name = getattr(path_or_buffer, "name", str(path_or_buffer))
     suffix = Path(str(name)).suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xls"}:
         return pd.read_excel(path_or_buffer, sheet_name=sheet or 0,
                              header=None, dtype=object)
+
+    text = _read_text(path_or_buffer)
+    delimiter = _sniff_delimiter(text, suffix)
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    if not rows:
+        raise ReaderError("the file is empty")
+    width = max(len(row) for row in rows)
+    padded = [row + [""] * (width - len(row)) for row in rows]
+    return pd.DataFrame(padded, dtype=object).replace("", None)
+
+
+def _read_text(path_or_buffer) -> str:
     if isinstance(path_or_buffer, (bytes, bytearray)):
-        path_or_buffer = io.BytesIO(path_or_buffer)
-    sep = "\t" if suffix in {".tsv", ".txt"} else None
-    return pd.read_csv(path_or_buffer, header=None, dtype=object, sep=sep,
-                       engine="python", encoding="utf-8-sig",
-                       skip_blank_lines=False)
+        return bytes(path_or_buffer).decode("utf-8-sig", errors="replace")
+    if hasattr(path_or_buffer, "read"):
+        content = path_or_buffer.read()
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content).decode("utf-8-sig", errors="replace")
+        return content.lstrip("\ufeff")
+    return Path(str(path_or_buffer)).read_text(encoding="utf-8-sig",
+                                               errors="replace")
+
+
+def _sniff_delimiter(text: str, suffix: str) -> str:
+    """Pick the separator from the line that looks most like a header."""
+    if suffix == ".tsv":
+        return "\t"
+    sample = "\n".join(text.splitlines()[:40])
+    counts = {d: sample.count(d) for d in (",", "\t", ";")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] else ","
 
 
 def _clean(cell: object) -> str:
@@ -174,7 +205,12 @@ def _clean(cell: object) -> str:
 
 
 def _find_header_row(raw: pd.DataFrame, max_scan: int = 60) -> int:
-    """The first row that carries several well labels (wide) or a time label."""
+    """The first row carrying well labels, and ideally a time label too.
+
+    A single-well run is legitimate, so one well label is enough - but only
+    when a time label sits beside it, which keeps a stray metadata cell called
+    'A1' from being mistaken for the header.
+    """
     best_row, best_score = None, 0
     for i in range(min(max_scan, len(raw))):
         cells = [_clean(c) for c in raw.iloc[i].tolist()]
@@ -182,7 +218,7 @@ def _find_header_row(raw: pd.DataFrame, max_scan: int = 60) -> int:
         timey = any(c.lower().replace(" ", "") in _TIME_NAMES
                     or c.lower().startswith("time") for c in cells)
         score = wells + (3 if timey else 0)
-        if wells >= 2 and score > best_score:
+        if (wells >= 2 or (wells == 1 and timey)) and score > best_score:
             best_row, best_score = i, score
     if best_row is None:
         raise ReaderError(

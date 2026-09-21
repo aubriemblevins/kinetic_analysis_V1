@@ -208,8 +208,14 @@ def analyse(
     units: dict[str, str] | None = None,
     outlier_sd: float = 2.5,
     cv_warn: float = 20.0,
+    well_settings: dict[str, DetectionSettings] | None = None,
 ) -> AnalysisResult:
-    """Fit every well, correct for background, and average replicates."""
+    """Fit every well, correct for background, and average replicates.
+
+    ``well_settings`` overrides the detection settings for named wells, which
+    is how a hand-picked window for one awkward curve is applied without
+    disturbing the rest of the plate.
+    """
     settings = settings or DetectionSettings()
     if blank_mode not in BLANK_MODES:
         raise ValueError(
@@ -254,7 +260,8 @@ def analyse(
         if blank_trace is not None and info.role != "blank":
             signal = signal - blank_trace
         try:
-            fit = detect_linear_range(data.time, signal, settings)
+            fit = detect_linear_range(
+                data.time, signal, (well_settings or {}).get(well, settings))
         except LinearityError as exc:
             results[well] = WellResult(well, info, None, float("nan"),
                                        float("nan"), float("nan"),
