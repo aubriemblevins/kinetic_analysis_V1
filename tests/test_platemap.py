@@ -143,3 +143,20 @@ def test_grid_map():
         "# compound\n,1,2\nA,Cmpd1,Cmpd1\nB,Cmpd1,Cmpd1\n")
     assert plate_map.wells["A2"].factor("substrate").conc.to("uM") == pytest.approx(25)
     assert plate_map.wells["B1"].factor("compound").name == "Cmpd1"
+
+
+def test_exported_long_map_round_trips(example_map, tmp_path):
+    """A resolved map written out must read back the same."""
+    from enzkin.platemap import read_map
+    path = tmp_path / "map.csv"
+    example_map.to_csv(path)
+    again = read_map(path)
+    assert len(again.replicate_groups()) == len(example_map.replicate_groups())
+    for well in ("A1", "A11", "F12", "G3", "H1", "H5"):
+        before, after = example_map.wells[well], again.wells[well]
+        assert before.role == after.role
+        for factor in ("protein", "compound", "substrate"):
+            first, second = before.factor(factor).conc, after.factor(factor).conc
+            assert (first is None) == (second is None)
+            if first is not None:
+                assert first.canonical == pytest.approx(second.canonical)

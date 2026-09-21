@@ -15,6 +15,7 @@ A map can be written three ways, whichever suits the person at the bench:
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import re
@@ -287,6 +288,11 @@ def _canonical_column(name: str) -> tuple[str, str, str | None] | None:
     text = text.replace("[", "").replace("]", "")
     if text in {"well", "wells", "well_id", "position"}:
         return ("well", "well", None)
+    # Where the well sits, not what is in it - ignore, or every well becomes
+    # its own condition and nothing is ever a replicate of anything.
+    if text in {"row", "column", "col", "plate_row", "plate_column",
+                "plate", "plate_id", "index"}:
+        return None
     if text in {"role", "well_type", "type", "sample_type"}:
         return ("role", "role", None)
     if text in {"group", "condition", "replicate_group"}:
@@ -296,14 +302,22 @@ def _canonical_column(name: str) -> tuple[str, str, str | None] | None:
     if text in {"notes", "note", "comment", "comments"}:
         return ("notes", "notes", None)
 
+    # A separate "<factor>_unit" column supplies the unit for "<factor>_conc",
+    # which is how this tool writes a resolved map back out.
+    for suffix in ("_unit", "_units", "_uom"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            stem = text[: -len(suffix)]
+            return (_FACTOR_ALIASES.get(stem, stem), "unit", None)
+
     unit = None
     match = re.search(r"[_(]([a-zA-Zµμ%/]+)\)?$", text)
     if match:
         candidate = match.group(1)
         try:
             from .units import normalise_unit
-            normalise_unit(candidate)
-            unit = candidate
+            # Keep the canonical spelling: the header was lower-cased for
+            # matching, and "um" should still display as "uM".
+            unit = normalise_unit(candidate)[1]
             text = text[: match.start()].rstrip("_(")
         except UnitError:
             unit = None
@@ -358,13 +372,15 @@ def read_long_map(path_or_frame, plate=None) -> PlateMap:
 
     factor_names: list[str] = []
     for _, (base, kind, _u) in mapping.items():
-        if kind in {"name", "conc"} and base not in factor_names:
+        if kind in {"name", "conc", "unit"} and base not in factor_names:
             factor_names.append(base)
     order = [f for f in CORE_FACTORS if f in factor_names]
     order += [f for f in factor_names if f not in order]
 
     wells: dict[str, WellInfo] = {}
     units: dict[str, str] = {}
+    unit_columns = {base: column for column, (base, kind, _u) in mapping.items()
+                    if kind == "unit"}
     for _, row in frame.iterrows():
         well_text = str(row[well_columns[0]]).strip()
         if not well_text or well_text.lower() == "nan":
@@ -390,9 +406,17 @@ def read_long_map(path_or_frame, plate=None) -> PlateMap:
             elif kind == "name":
                 name, conc = factors.get(base, (None, None))
                 factors[base] = ((text or None), conc)
+            elif kind == "unit":
+                continue  # consumed by the matching concentration column
             elif kind == "conc":
+                row_unit = unit
+                if row_unit is None and base in unit_columns:
+                    stated = row.get(unit_columns[base])
+                    if stated is not None and str(stated).strip().lower() not in {
+                            "", "nan", "none"}:
+                        row_unit = str(stated).strip()
                 try:
-                    quantity = parse_quantity(text, default_unit=unit)
+                    quantity = parse_quantity(text, default_unit=row_unit)
                 except UnitError as exc:
                     raise PlateMapError(
                         f"{well}: could not read {column!r} value {text!r} ({exc}). "
@@ -401,7 +425,7 @@ def read_long_map(path_or_frame, plate=None) -> PlateMap:
                     ) from exc
                 name, _ = factors.get(base, (None, None))
                 factors[base] = (name, quantity)
-                if quantity is not None and base not in units and unit:
+                if quantity is not None and base not in units and row_unit:
                     units[base] = quantity.unit
         info.factors = {b: Factor(n, c) for b, (n, c) in factors.items()
                         if not (n is None and c is None)}
@@ -622,26 +646,36 @@ def read_layout(path) -> dict:
     return loaded
 
 
+def _suffix_of(path) -> str:
+    """The file extension, whether given a path, a Path or an upload."""
+    if hasattr(path, "read"):
+        return Path(str(getattr(path, "name", ""))).suffix.lower()
+    return Path(str(path)).suffix.lower()
+
+
 def read_map(path, plate=None) -> PlateMap:
     """Read a plate map from any supported file type."""
-    name = str(getattr(path, "name", path))
-    suffix = Path(name).suffix.lower()
+    suffix = _suffix_of(path)
     if suffix in {".yaml", ".yml", ".json"}:
         return map_from_layout(read_layout(path))
-    if suffix in {".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"}:
-        head = None
-        if suffix in {".csv", ".tsv", ".txt"}:
-            raw = Path(name).read_text(encoding="utf-8-sig") if not hasattr(path, "read") \
-                else path.read()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8-sig")
-            head = raw
-            if re.search(r"^\s*#\s*\w+", raw, re.MULTILINE):
-                return read_grid_map(raw, plate)
-            import io as _io
-            path = _io.StringIO(raw)
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
         return read_long_map(path, plate)
-    raise PlateMapError(f"unsupported plate-map file type: {suffix or name}")
+    if suffix in {".csv", ".tsv", ".txt"}:
+        if hasattr(path, "read"):
+            raw = path.read()
+        else:
+            raw = Path(str(path)).read_text(encoding="utf-8-sig")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8-sig")
+        # A leading "# field" line means plate-shaped grids rather than a table.
+        if re.search(r"^\s*#\s*\w+", raw, re.MULTILINE):
+            return read_grid_map(raw, plate)
+        buffer = io.StringIO(raw)
+        buffer.name = str(getattr(path, "name", path))
+        return read_long_map(buffer, plate)
+    raise PlateMapError(
+        f"unsupported plate-map file type: {suffix or path!r}. "
+        "Use .yaml/.json for layout rules, or .csv/.xlsx for a table.")
 
 
 # --- grid maps ------------------------------------------------------------
