@@ -60,6 +60,12 @@ FLAG_DESCRIPTIONS = {
 }
 
 
+#: Flags that merely describe the window chosen - not problems.
+INFORMATIONAL_FLAGS = frozenset({
+    "uses_whole_curve", "lag_phase", "curve_bends", "decreasing", "missing_data",
+})
+
+
 class LinearityError(ValueError):
     """Raised when a curve cannot be fitted at all."""
 
@@ -113,10 +119,14 @@ class LinearFit:
         return self.intercept + self.slope * np.asarray(x, dtype=float)
 
     @property
+    def concerns(self) -> list[str]:
+        """Flags that call for a human to look at the curve."""
+        return [f for f in self.flags if f not in INFORMATIONAL_FLAGS]
+
+    @property
     def ok(self) -> bool:
-        """True when nothing about this fit needs a human to look at it."""
-        return not ({"low_signal", "no_linear_range", "poor_fit", "few_points",
-                     "relaxed", "saturated", "fast_reaction"} & set(self.flags))
+        """True when nothing about this fit needs a second look."""
+        return not self.concerns
 
 
 @dataclass
